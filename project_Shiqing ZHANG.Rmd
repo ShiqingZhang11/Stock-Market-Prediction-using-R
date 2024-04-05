@@ -1,0 +1,575 @@
+---
+title: "US Stock Market Prediction"
+author: "ShiqingZHANG"
+date: "2024-04-01"
+output: html_document
+---
+
+
+# 1. Import Libraries
+```{r}
+suppressWarnings({
+}) 
+Sys.setenv(LANG = "en")
+library(knitr) 
+library(tidyverse)
+library(data.table)         
+library(dplyr)   
+library(tidyr)
+library(fastDummies)        
+library(ggplot2)
+library(reshape2)
+library(gridExtra)          
+library(lightgbm) 
+library(scales)
+library(plotly)
+library(caret)
+library(lightgbm)
+library(Metrics)
+library(zoo)
+library(tseries)
+library(urca)
+```
+
+
+# 2. Data wrangling
+
+```{r}
+load("C:/Users/Shiqing/Desktop/Emlyon/[21]2024_7MPFDA_02 Finance & data analysis with R/Project/stocks_clean.RData")
+stocks <- stocks_clean
+head(stocks) 
+tail(stocks)
+```
+
+
+# 3. Dataset Description
+
+## Dimension
+
+```{r}
+dim(stocks)
+```
+This data set has 13 variables(columns) and 289,271 observations(rows).
+
+## Structure
+
+```{r}
+str(stocks[,])
+sapply(stocks, class) %>% table() |> head()
+```
+This data set has 1 variable named ticker is companies' stock name, 1 variable in date format, and 11 variables in numerical type which include the outcome variable return.
+
+## Missing values
+
+```{r}
+missing_proportion <- colMeans(is.na(stocks)) 
+missing_summary <- data.frame(Variable = names(missing_proportion), Proportion_Missing = missing_proportion) 
+missing_summary
+```
+We conducted data cleaning based on the following criteria:
+
+1. We dropped the variables ghg_s1, ghg_s2, and ghg_s3 because they had missing values in at least 87% of the cases.
+
+2. For the remaining variables, we deleted the missing values if they were present in less than 7% of the cases.
+
+```{r}
+stocks <- stocks[, !(names(stocks) %in% c("ghg_s1", "ghg_s2", "ghg_s3"))]
+stocks <- na.omit(stocks)
+dim(stocks)[1]
+```
+For the first time, we remove 8.11% observations from the original data set, now we have 265,808 observations in data set.
+
+## Statistics
+
+```{r}
+statistics <- summary(stocks)
+statistics
+```
+## Boxplots of numerical variables
+
+```{r}
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+variables <- c("price", "market_cap", "price_to_book", "debt_to_equity", "profitability", "volatility", "revenue", "return")
+
+for (var in variables) {
+  p <- ggplot(stocks, aes_string(y = var)) +
+    geom_boxplot() +
+    scale_y_log10()+
+    labs(title = paste("Box Plot of", var),
+         y = var) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 16)) +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14))
+  
+  print(p)
+}
+```
+
+
+## Extreme values
+
+```{r}
+variables <- c("price", "market_cap", "price_to_book", "debt_to_equity", "profitability", "volatility", "revenue", "return")
+
+calculate_extreme_values <- function(var) {
+  q1 <- quantile(stocks[[var]], 0.25)
+  q3 <- quantile(stocks[[var]], 0.75)
+  iqr <- q3 - q1
+  
+  # Calculate extreme values
+  lower_extreme <- q1 - 80 * iqr
+  upper_extreme <- q3 + 80 * iqr
+  
+  # Subset extreme values
+  extreme_values <- stocks[[var]][stocks[[var]] < lower_extreme | stocks[[var]] > upper_extreme]
+  
+  return(extreme_values)
+}
+
+extreme_values_list <- lapply(variables, calculate_extreme_values)
+
+# Remove extreme values from each variable
+for (i in seq_along(variables)) {
+  var <- variables[i]
+  extreme_values <- extreme_values_list[[i]]
+  stocks <- stocks[!stocks[[var]] %in% extreme_values, ]
+}
+
+# Verify removal of extreme values
+summary(stocks)
+```
+For the second time, we remove less than 1% observations this time by dropping extreme values.
+
+```{r}
+cat("The number of unique stocks in the ticker variable is:", length(unique(stocks$ticker)))
+unique_stocks <- unique(stocks$ticker) # If you want to see each stock's name, display this variable.
+```
+```{r}
+# Filter the stocks data set for the year 2023
+stocks_2023 <- stocks %>%
+  filter(year(date) == 2023)
+
+cat("The number of unique stocks of 2023 in the ticker variable is:", n_distinct(stocks_2023$ticker))
+```
+
+Subsequently, we removed the stocks that were no longer present in 2023.
+
+## Final dataset
+
+```{r}
+# Extract year from date
+stocks <- stocks %>%
+  mutate(lag_date = date %m+% months(2))
+stocks <- stocks %>%
+  mutate(year = as.integer(format(lag_date, "%Y")),
+         month = as.integer(format(lag_date, "%m")))
+
+# Get the unique tickers present in 2023
+unique_stocksname_2023 <- unique(stocks_2023$ticker)
+
+# Filter the original data set to include only stocks present in 2023
+stocks <- stocks %>%
+  filter(ticker %in% unique_stocksname_2023)
+dim(stocks)
+```
+
+For the third time, we remove 9.57% percentage from the previous data set, having 238,154 observations now.
+
+
+## Histgrams of numerical variables
+
+```{r}
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+variables <- c("price", "market_cap", "price_to_book", "debt_to_equity", "profitability", "volatility", "revenue", "return")
+
+for (var in variables) {
+  p <- ggplot(stocks, aes_string(x = var)) +
+    geom_histogram(binwidth = 0.5, fill = "skyblue", color = "black") +
+    scale_y_log10()+
+    labs(title = paste("Histogram of", var),
+         x = var, y = "Frequency") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14))
+  
+  print(p)
+}
+```
+
+# 4. Pivot Table & ggplot
+
+## Pivot Table 1: Top 10 average return of stocks in 2023
+
+```{r}
+# Filter the stocks data set for the year 2023
+stocks_2023 <- stocks %>%
+  filter(year(date) == 2023)
+
+# Group by ticker and calculate the average return for each stock
+average_returns_2023 <- stocks_2023 %>%
+  group_by(ticker) %>%
+  summarize(average_return = mean(return, na.rm = TRUE))
+
+# Arrange in descending order of average return and select top 10 stocks
+top_10_stocks_2023 <- average_returns_2023 %>%
+  arrange(desc(average_return)) %>%
+  head(10)
+
+# Format the average return column to display percentages with two decimal places
+top_10_stocks_2023$average_return <- percent(top_10_stocks_2023$average_return, accuracy = 0.01)
+
+# Print the top 10 stocks with their average return
+print(top_10_stocks_2023)
+```
+## Ggplot 1: Line plot of the trends of Top 10 2023 Stocks
+
+```{r}
+# Filter the stocks data set for the top 10 stocks
+top_10_stocks_data <- stocks %>%
+  filter(ticker %in% top_10_stocks_2023$ticker)
+
+# Arrange the data by date
+top_10_stocks_data <- top_10_stocks_data %>%
+  arrange(date)
+
+# Plot the return of each stock in a line plot
+options(repr.plot.width = 20, repr.plot.height = 6)
+ggplot(top_10_stocks_data, aes(x = date, y = return, color = ticker)) +
+  geom_line() +
+  labs(title = "Return of 2023 Top 10 Stocks",
+       x = "Date",
+       y = "Return") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "30 month") +  # Set date breaks to one month
+  theme(legend.position = "top")
+```
+## Pivot Table 2: Top 10 stocks with the highest profitability from the top 50 stocks based on return
+
+```{r}
+# Filter the data set for the year 2023
+stocks_2023 <- stocks %>%
+  filter(year(date) == 2023)
+
+# Group by ticker and calculate the average return for each stock
+average_returns <- stocks_2023 %>%
+  group_by(ticker) %>%
+  summarize(average_return = mean(return, na.rm = TRUE))
+
+# Select the top 50 companies based on average return
+top_50_return <- average_returns %>%
+  arrange(desc(average_return)) %>%
+  head(50)
+
+# Now, for these top 50 companies, calculate their average profitability
+average_profitability <- stocks_2023 %>%
+  filter(ticker %in% top_50_return$ticker) %>%
+  group_by(ticker) %>%
+  summarize(average_profitability = mean(profitability, na.rm = TRUE))
+
+# Select the top 10 companies based on average profitability
+top_10_profitability <- average_profitability %>%
+  arrange(desc(average_profitability)) %>%
+  head(10)
+
+top_10_profitability$average_profitability <- percent(top_10_profitability$average_profitability, accuracy = 0.01)
+
+# Print the top 10 companies with the highest average profitability
+print(top_10_profitability)
+```
+## Pivot Table 3: Descending by avearge return of each stock in each year
+
+```{r}
+# Create pivot table
+pivot_table <- stocks %>%
+  group_by(year, ticker) %>%
+  summarize(
+    average_price = round(mean(price), 2),
+    average_market_cap = round(mean(market_cap), 2),
+    average_price_to_book = round(mean(price_to_book), 2),
+    average_debt_to_equity = round(mean(debt_to_equity), 2),
+    average_profitability = round(mean(profitability), 2),
+    average_volatility = round(mean(volatility), 2),
+    average_return = round(mean(return), 2)
+  ) %>%
+  arrange(year, desc(average_return))
+
+# Print pivot table
+print(pivot_table)
+```
+## Ggplot 2: Scatter plot of profitability vs. volatility
+
+```{r}
+ggplot(stocks, aes(x = profitability, y = volatility, size = market_cap, color = revenue)) +
+  geom_point() +
+  labs(title = "Scatter Plot of Profitability vs. Volatility",
+       x = "Profitability",
+       y = "Volatility",
+       size = "Market Cap",
+       color = "Revenue") +
+  scale_color_gradient(low = "blue", high = "red") +  # Adjust color scale
+  theme(legend.position = "top")
+```
+
+We can observe the following trends from the scatter plot: 
+
+1. Stocks with positive profitability typically exhibit volatility levels that do not exceed 250. Higher volatility tends to correlate with profitability close to 0.00% or even negative.
+
+2. Stocks with the largest market capitalization tend to have higher revenue and lower volatility. Additionally, their profitability typically falls within the range of (-500, 500). 
+
+3. Stocks with the highest revenue generally demonstrate lower volatility, typically less than 125, and profitability within the range of (-500, 500).
+
+
+# 5. Correlation Matrix
+
+## Ggplot 3: Heatmap for numerical variables
+
+```{r}
+# stocks <- stocks[, !names(stocks) %in% c("year", "month")]
+
+# Compute the correlation matrix using Pearson method
+correlation_matrix <- cor(stocks[, sapply(stocks, is.numeric)], method = "pearson")
+
+# Melt the correlation matrix for visualization
+melted_correlation <- melt(correlation_matrix)
+
+# Round the correlation coefficients to two decimal places
+melted_correlation$value <- round(melted_correlation$value, 2)
+
+# Create a heatmap with correlation coefficients displayed
+ggplot(melted_correlation, aes(Var1, Var2, fill = value, label = value)) +
+  geom_tile(color = "white") +
+  geom_text(color = "black") +  # Add text labels
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limit = c(-1,1), space = "Lab", name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  coord_fixed()
+```
+For continuous variables, the Pearson correlation coefficient is typically used to measure the linear relationship between two variables.  
+
+Only market capitalization and revenue exhibit a relatively strong positive correlation, while the other variables do not show significant correlations.
+
+
+# 6. Modeling
+
+We have done with missing value in data description step, we only do encode categorical variables.
+
+## Encode categorical variables
+
+```{r}
+stocks <- stocks %>%
+  mutate(ticker = as.factor(ticker))
+```
+
+## LightGBM do prediction
+
+```{r}
+# Set the seed for reproducibility
+set.seed(123)
+
+# 1. Prepare Data
+features <- subset(stocks, select = c("price", "market_cap", "price_to_book", "debt_to_equity", "profitability", "volatility", "revenue", "year", "month"))
+target <- stocks$return
+
+# 2. Split Data set
+train_index <- createDataPartition(target, p = 0.8, list = FALSE)
+train_set <- stocks[train_index, ]
+test_set <- stocks[-train_index, ]
+
+# 3. Train LightGBM Model
+lgb_train <- lgb.Dataset(data = as.matrix(train_set[, -c(1, 2)]), label = train_set$return)
+lgb_test <- lgb.Dataset(data = as.matrix(test_set[, -c(1, 2)]), label = test_set$return)
+
+params <- list(
+  objective = "regression",
+  metric = "mse"
+)
+
+model <- lgb.train(params = params,
+                   data = lgb_train,
+                   valids = list(test = lgb_test),
+                   nrounds = 100,
+                   verbose = 0)
+
+# 4. Evaluate Model
+predictions <- predict(model, as.matrix(test_set[, -c(1, 2)]))
+
+# Calculate evaluation metrics
+explained_variance <- caret::R2(pred = predictions, obs = test_set$return)
+mean_absolute_error <- mae(test_set$return, predictions)
+mean_squared_error <- mse(test_set$return, predictions)
+r2_score <- R2(pred = predictions, obs = test_set$return)
+
+# Print evaluation metrics
+print(paste("Explained Variance Score:", round(explained_variance, 4)))
+print(paste("Mean Absolute Error:", round(mean_absolute_error, 4)))
+print(paste("Mean Squared Error:", round(mean_squared_error, 4)))
+print(paste("R-squared Score:", round(r2_score, 4)))
+```
+
+1. Explained Variance Score of 0.974 indicates that the model accounts for approximately 97.4% of the variance in the return variable.
+
+2. The MAE of 0.0029 suggests that, on average, the model's predictions are approximately 0.0029 away from the actual returns.
+
+3. The MSE of 0.0003 suggests that, on average, the squared difference between the predicted and actual returns is approximately 0.0003.
+
+4. Similar to Explained Variance Score, R-squared Score of 0.974 indicates that approximately 97.4% of the variance in the target variable is explained by the features included in the model.
+
+
+## Cross Validation
+
+```{r}
+
+# 1. Prepare Data
+# features <- subset(stocks, select = c("price", "market_cap", "price_to_book", "debt_to_equity", "profitability", "volatility", "revenue"))
+# target <- stocks$return
+
+# 2. Define data for LightGBM
+lgb_data <- lgb.Dataset(data = as.matrix(features), label = target)
+
+# 3. Define parameters
+params <- list(
+  objective = "regression",
+  metric = "mse"
+)
+
+# 4. Define number of rounds
+num_rounds <- 100
+
+# 5. Perform Cross-validation
+num_folds <- 10
+folds <- caret::createFolds(target, k = num_folds, list = TRUE, returnTrain = FALSE)
+
+cv_results <- lapply(folds, function(fold_indices) {
+  train_data <- as.matrix(features[-fold_indices, ])
+  valid_data <- as.matrix(features[fold_indices, ])
+  
+  lgb_train <- lgb.Dataset(data = train_data, label = target[-fold_indices])
+  lgb_valid <- lgb.Dataset(data = valid_data, label = target[fold_indices], reference = lgb_train)
+  
+  model <- lgb.train(params = params,
+                     data = lgb_train,
+                     valids = list(validation = lgb_valid),
+                     nrounds = num_rounds,
+                     verbose = 0)
+  
+  predictions <- predict(model, valid_data)
+  mse <- mean((predictions - target[fold_indices])^2)
+  
+  return(list(model = model, mse = mse))
+})
+
+# 6. Print CV results
+print(cv_results)
+```
+
+## Boxplot to visualize MSE
+
+```{r}
+# Extract MSE values from cv_results
+mse_values <- sapply(cv_results, function(fold) fold$mse)
+
+# Create a boxplot to visualize MSE distribution across folds
+boxplot(mse_values, 
+        main = "MSE Distribution Across Folds",
+        xlab = "Fold",
+        ylab = "Mean Squared Error",
+        col = "lightblue",
+        border = "black")
+```
+The central tendency, spread, and variability of MSE show that this model doesn't have high volatility in score, suggesting consistent performance across different folds of the cross-validation process. 
+
+## Hyper Tuning
+
+```{r}
+# 7. Perform Grid Search CV
+hyper_grid <- list(
+  nrounds = c(50, 100, 150),  # Number of boosting rounds
+  learning_rate = c(0.01, 0.05, 0.1),  # Learning rate
+  max_depth = c(3, 5, 7)  # Maximum tree depth
+)
+
+best_mse <- Inf
+best_model <- NULL
+
+for (params in expand.grid(hyper_grid)) {
+  mse_sum <- 0
+  
+  for (fold_indices in folds) {
+    train_data <- as.matrix(features[-fold_indices, ])
+    valid_data <- as.matrix(features[fold_indices, ])
+  
+    lgb_train <- lgb.Dataset(data = train_data, label = target[-fold_indices])
+    lgb_valid <- lgb.Dataset(data = valid_data, label = target[fold_indices], reference = lgb_train)
+  
+    model <- lgb.train(params = list(params),
+                       data = lgb_train,
+                       valids = list(validation = lgb_valid),
+                       nrounds = num_rounds,
+                       verbose = 0)
+  
+    predictions <- predict(model, valid_data)
+    mse <- mean((predictions - target[fold_indices])^2)
+    
+    mse_sum <- mse_sum + mse
+  }
+  
+  avg_mse <- mse_sum / num_folds
+  
+  if (avg_mse < best_mse) {
+    best_mse <- avg_mse
+    best_model <- list(params = params, mse = avg_mse)
+  }
+}
+
+# 8. Print best model
+print(best_model)
+```
+## Feature Importances
+
+```{r}
+# 9. Retrieve the best parameters
+best_params <- best_model$params
+
+# 10. Train a model using the best parameters
+# Define the best model's parameters
+best_num_rounds <- 100  
+best_params <- c(best_params, list(nrounds = best_num_rounds))
+
+# Train the best model
+best_lgb_train <- lgb.Dataset(data = as.matrix(features), label = target)
+best_model <- lgb.train(params = best_params,
+                        data = best_lgb_train,
+                        nrounds = best_num_rounds,
+                        verbose = 0)
+
+# 11. Compute feature importance
+importance <- lgb.importance(best_model)
+
+ggplot(importance, aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col(fill = "#22AABB", alpha = 0.7) +
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 6),
+        plot.title = element_text(size = 10)) +
+  coord_cartesian(clip = "off", ylim = c(0, length(importance$Feature))) +
+  labs(title = "Feature Importance") +
+  theme(plot.margin = margin(10, 30, 10, 10))
+```
+# 7. Conclusion
+
+The performance of the model using LightGBM yielded high explanatory power and lower error in predicting the returns of stocks. Among the features considered, Price to Book ratio, volatility, and Debt to Equity emerged as the most influential predictors of return.
+
+For year and month, we can see that the return of each stock is significantly affected by time.This because stock prices are influenced by macro market trends, economic conditions, interest rates, inflation, and investor sentiment, all of which change over time. 
+
+The P/B ratio serves as a valuable metric for evaluating the relative valuation of stocks. It provides insight into how the market values a company's assets compared to its book value, offering clues about potential investment opportunities. 
+
+Volatility is another crucial factor, offering insights into the risk associated with an investment. Higher volatility implies greater fluctuations in stock prices, which can present both opportunities and risks for investors.
+
+Additionally, the D/E ratio plays a pivotal role in assessing a company's financial health and risk profile. A high D/E ratio suggests that the company relies more on debt financing, which may indicate higher financial risk.
+
+These three factors collectively contribute to the assessment of a company's financial health and risk profile, thereby influencing the returns of their stocks. However, it's important to note that predicting future returns solely based on historical price movements or revenue figures can be challenging. Changes in stock price and revenue may not immediately impact future returns, highlighting the need for a comprehensive analysis that considers a range of factors beyond historical data.
